@@ -32,6 +32,7 @@ from cartography.intel.aws.util.common import parse_and_validate_aws_account_ids
 from cartography.intel.aws.util.common import parse_and_validate_aws_regions
 from cartography.intel.aws.util.common import parse_and_validate_aws_requested_syncs
 from cartography.stats import get_stats_client
+from cartography.util import is_service_control_policy_explicit_deny
 from cartography.util import merge_module_sync_metadata
 from cartography.util import run_analysis_and_ensure_deps
 from cartography.util import run_cleanup_job
@@ -184,25 +185,35 @@ def _sync_one_account(
         if func_name not in requested_syncs_set:
             continue
         # Skip permission relationships and tags for now because they rely on data already being in the graph
-        if func_name == "ecr:image_layers":
-            # has a different signature than the other functions (aioboto3_session replaces boto3_session)
-            if aioboto3_session is None:
-                aioboto3_session_factory = aioboto3_session_factory or aioboto3.Session
-                aioboto3_session = aioboto3_session_factory()
+        try:
+            if func_name == "ecr:image_layers":
+                # has a different signature than the other functions (aioboto3_session replaces boto3_session)
+                if aioboto3_session is None:
+                    aioboto3_session_factory = aioboto3_session_factory or aioboto3.Session
+                    aioboto3_session = aioboto3_session_factory()
 
-            RESOURCE_FUNCTIONS[func_name](
-                neo4j_session,
-                aioboto3_session,
-                regions,
-                current_aws_account_id,
-                update_tag,
-                common_job_parameters,
-                aioboto3_session_factory=aioboto3_session_factory,
-            )
-        elif func_name in ["permission_relationships", "resourcegroupstaggingapi"]:
-            continue
-        else:
-            RESOURCE_FUNCTIONS[func_name](**sync_args)
+                RESOURCE_FUNCTIONS[func_name](
+                    neo4j_session,
+                    aioboto3_session,
+                    regions,
+                    current_aws_account_id,
+                    update_tag,
+                    common_job_parameters,
+                    aioboto3_session_factory=aioboto3_session_factory,
+                )
+            elif func_name in ["permission_relationships", "resourcegroupstaggingapi"]:
+                continue
+            else:
+                RESOURCE_FUNCTIONS[func_name](**sync_args)
+        except botocore.exceptions.ClientError as e:
+            if is_service_control_policy_explicit_deny(e):
+                logger.warning(
+                    "Service control policy denied access while syncing module '%s'. Skipping this module.",
+                    func_name,
+                    exc_info=True,
+                )
+                continue
+            raise
 
     # MAP IAM permissions
     if "permission_relationships" in aws_requested_syncs:

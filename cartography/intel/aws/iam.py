@@ -414,6 +414,7 @@ def get_user_access_keys_data(
 
 
 @timeit
+@aws_handle_regions
 def get_account_access_key_data(
     boto3_session: boto3.Session,
     username: str,
