@@ -1,0 +1,454 @@
+#+TITLE: Cartography — Security Coverage and Gap Analysis
+#+SUBTITLE: What the graph models today, and what is missing to assess a monitored account
+#+AUTHOR: Analysis against upstream master @ eec5278
+#+DATE: 2026-09-13
+#+OPTIONS: toc:3 num:t
+
+* Scope and method
+
+This analysis was produced by reading the code on branch
+=claude/sync-upstream-branch-0w2wo2=, synced to upstream
+=cartography-cncf/cartography= at commit =eec5278=.
+
+The question is deliberately narrow: *if Cartography is the only telemetry you
+have about a monitored cloud account, what security questions can you answer,
+and which ones can you not?*
+
+Every claim below was verified against the source tree, not from memory. Where
+the upstream maintainers already track a gap as a =# TODO= in the rules
+package, that is called out — those are the cheapest wins because the intent
+is already documented.
+
+Method:
+
+1. Enumerate intel modules, data-model node/relationship schemas, analysis jobs
+   and rules (see [[Layer 1: inventory (the node graph)]] through [[Layer 4: rules and frameworks]]).
+2. For AWS specifically, enumerate every =boto3= service client the codebase
+   instantiates, which is an exact lower bound on API coverage.
+3. Compare against the primitives an assessor actually needs: effective
+   permissions, reachability, credential material, detective controls, and
+   change over time.
+
+** Headline numbers
+
+| Metric                                        | Count |
+|-----------------------------------------------+-------|
+| Intel modules (providers/integrations)        |    63 |
+| Node schemas (=CartographyNodeSchema=)        |  1054 |
+| Relationship schemas (=CartographyRelSchema=) |  2259 |
+| AWS node schemas                              |   201 |
+| AWS =boto3= service clients used              |    48 |
+| Ontology labels                               |    43 |
+| Security =Fact= definitions (rules)           |   190 |
+| Compliance frameworks                         | 4 (CIS, ISO 27001, SOC 2, NIST AI RMF) |
+| Open =# TODO= gaps inside the rules package   |   314 |
+
+* What Cartography currently covers
+
+Cartography assesses an account in four stacked layers. Understanding the
+layering matters, because most of the real gaps are *not* missing inventory —
+they are missing derivation on top of inventory that already exists.
+
+** Layer 1: inventory (the node graph)
+
+Breadth is genuinely excellent. 63 intel modules spanning:
+
+- *IaaS/PaaS*: AWS, Azure, GCP, OCI, DigitalOcean, Scaleway, Kubernetes
+- *Identity*: Entra ID, Okta, Google Workspace, JumpCloud, Keycloak, Duo,
+  WorkOS, Workday, Lastpass
+- *Endpoint/MDM*: CrowdStrike, SentinelOne, Huntress, Jamf, Kandji, Miradore,
+  Intune, BigFix, SnipeIT
+- *SDLC/supply chain*: GitHub, GitLab, Semgrep, Syft, Trivy, Docker Scout,
+  Socket.dev, Zizmor, CircleCI, Spacelift, AIBOM, CVE feeds
+- *SaaS/AI*: Slack, Salesforce, Snowflake, Databricks, Sentry, PagerDuty,
+  OpenAI, Anthropic, Modal, Vercel, Netlify, Railway, Supabase, Airbyte,
+  Cloudflare, Tailscale
+- *Security products*: Wiz, Tenable, Orca, BBOT, Subimage
+
+For AWS, the 48 service clients instantiated are:
+
+#+BEGIN_EXAMPLE
+acm apigateway apigatewayv2 autoscaling bedrock bedrock-agent cloudformation
+cloudfront cloudtrail cloudwatch codebuild cognito-identity cognito-idp config
+dynamodb ec2 ecr ecs efs eks elasticache elb elbv2 emr es events glue guardduty
+iam identitystore inspector2 kms lambda logs organizations rds redshift
+resourcegroupstaggingapi route53 s3 s3control sagemaker secretsmanager
+securityhub sesv2 sns sqs ssm sso-admin sts
+#+END_EXAMPLE
+
+IAM in particular is modeled deeply: users, groups, roles, managed and inline
+policies, *individual policy statements as nodes*, access keys (including
+=lastuseddate=, =lastusedservice=, =lastusedregion=), MFA devices, instance
+profiles, SAML providers, server certificates, federated principals, service
+principals, the root principal, the account summary, and
+=AWSPrincipalServiceAccess= (IAM Access Advisor / service-last-accessed data).
+
+The AWS Organizations hierarchy — Organization, Root, OU, Account, with parent
+and child edges — is modeled.
+
+** Layer 2: derived analysis (analysis jobs)
+
+Thirteen typed AWS analysis jobs run post-ingestion. The security-relevant ones:
+
+- =aws_ec2_iaminstanceprofile= — materialises
+  =(:AWSEC2Instance)-[:STS_ASSUMEROLE_ALLOW]->(:AWSRole)=
+- =aws_ec2_asset_exposure_instance= / =_load_balancer= / =_load_balancer_v2= /
+  =_auto_scaling_group= / =aws_eks_asset_exposure= / =aws_ecs_asset_exposure= —
+  set =exposed_internet= and =exposed_internet_type=
+- =aws_lb_container_exposure=, =aws_lb_nacl_direct=
+- =aws_foreign_accounts= — cross-account trust
+- =aws_ec2_keypair_analysis_matching_fingerprint= — key reuse across accounts
+- =aws_lambda_ecr= — links Lambda code SHA to its ECR image
+
+Equivalent analysis packages exist for GCP, Azure, Kubernetes, Entra, Intune,
+GSuite, Scaleway, Semgrep, AIBOM and the ontology.
+
+** Layer 3: the cross-provider ontology
+
+43 semantic labels (=UserAccount=, =ServiceAccount=, =PermissionRole=,
+=ComputeInstance=, =ObjectStorage=, =Database=, =Secret=, =EncryptionKey=,
+=LoadBalancer=, =Tenant=, =CVE=, =PackageVersion=, …) plus canonical =User=,
+=Device=, =Package=, =PackageVersion= and =PublicIP= nodes.
+
+A constraint set in =cartography/models/ontology/constraints.py= enforces
+canonical edges: =HAS_ACCOUNT=, =HAS_ROLE=, =ASSUMES=, =RUNS_AS=, =MEMBER_OF=,
+=USES_SECRET=, =ENCRYPTED_BY=, =WORKLOAD_PARENT=, =EXPOSE=, =AFFECTS=,
+=DEPLOYED=, =OWNED_BY=, =RESOLVED_IMAGE=.
+
+This is the layer that makes a *cross-provider* assessment possible at all, and
+it is the project's strongest differentiator against per-cloud CSPM tools.
+
+** Layer 4: rules and frameworks
+
+190 =Fact= definitions across 36 rule modules, aggregated into four frameworks
+(CIS for AWS/GCP/Kubernetes/Google Workspace, ISO 27001, SOC 2, NIST AI RMF).
+Each =Fact= is a validated Cypher query bound to a Pydantic =Finding= output
+model, so results are typed rather than free-form rows.
+
+Coverage themes: public object storage, exposed compute/database/serverless,
+exposed Kubernetes control planes, MFA gaps, admin privilege sprawl, external
+account trust, inactive accounts, unmanaged accounts, EOL software, device
+posture, transport encryption, backup gaps, deactivated security products,
+GuardDuty active threats, unpinned GitHub Actions, and the Shai-Hulud npm
+compromise.
+
+* Where the gaps are
+
+The gaps fall into eight groups, roughly ordered by how much they limit a real
+assessment.
+
+** A. Effective-permission evaluation is incomplete
+
+This is the single largest gap, and it undermines every IAM finding the tool
+produces.
+
+=cartography/intel/aws/permission_relationships.py= evaluates
+Action/NotAction/Resource/NotResource/Effect against *identity-attached
+policies only*. What it does not consider:
+
+*** A1. Service Control Policies and Resource Control Policies — not modeled at all
+
+The Organizations hierarchy is ingested, but =describe_policy= /
+=list_policies_for_target= are never called. Grep for =ServiceControlPolicy=
+returns only two incidental comments in =iam.py=.
+
+Consequence: every "principal X can do Y" edge is an *upper bound that may be
+entirely false*. An account under a restrictive SCP will be reported as having
+permissions it demonstrably cannot exercise. For an assessor this produces
+findings the customer will correctly reject, which costs credibility.
+
+*** A2. Permissions boundaries — not modeled at all
+
+=grep -rn "PermissionsBoundary"= over the whole tree returns nothing. A
+boundary is the standard mechanism for safe delegated administration; without
+it, a role that is deliberately constrained looks identical to one that is not.
+
+*** A3. Resource-based policies are ingested but not evaluated
+
+S3 bucket policies and KMS key policies are fetched (and KMS gets an
+=anonymous_access= / =anonymous_actions= flag), but they are not fed into the
+permission-relationship engine. Lambda function policies, SQS/SNS queue and
+topic policies, ECR repository policies, Secrets Manager resource policies,
+EFS file system policies, API Gateway resource policies and OpenSearch access
+policies are not fetched at all.
+
+Consequence: cross-account access *granted by the resource* is invisible.
+This is precisely the direction most real-world cross-account compromise takes.
+
+*** A4. Condition keys are detected but not evaluated
+
+=collect_edge_conditions= fails safe — if a grant is gated by any =Condition=,
+the edge is flagged conditional. That is correct and honest, but it means the
+graph cannot distinguish =aws:SourceIp= scoping from =aws:PrincipalOrgID=
+scoping from a trivially-satisfiable =aws:RequestedRegion=. For trust-policy
+analysis (the =sts:ExternalId= / =aws:PrincipalOrgID= question) this is the
+difference between a critical finding and a non-issue.
+
+*** A5. The default permission map is thin
+
+=cartography/data/permission_relationships.yaml= ships only *12* target-label
+mappings (S3, DynamoDB, Secrets Manager, Redshift, RDS, ECS task exec, …).
+Privilege-escalation-relevant permissions — =iam:PassRole=, =iam:CreatePolicyVersion=,
+=iam:AttachUserPolicy=, =lambda:UpdateFunctionCode=, =ssm:SendCommand=,
+=ec2:RunInstances= paired with =iam:PassRole=, =cloudformation:CreateStack=,
+=glue:UpdateDevEndpoint= — are absent. The engine is capable of expressing
+them; the shipped configuration simply does not.
+
+** B. Network reachability is approximated, not computed
+
+The *inventory* is complete: =AWSEC2NetworkAclRule= nodes, route table route
+nodes (including NAT gateway, egress-only IGW, carrier gateway and prefix-list
+targets), internet gateways, subnets, VPC peerings, transit gateways and VPC
+endpoints are all modeled.
+
+The *derivation* is not. =cartography/analysis/aws/analysis.py= computes
+=exposed_internet= from exactly three inputs: a security group ingress rule
+allowing =0.0.0.0/0=, the presence of a public IP, and the load balancer
+=scheme= field. Route tables and NACL rules are never consulted.
+
+Two concrete error classes follow:
+
+1. *False positives* — an instance with a public IP and an open SG in a subnet
+   whose route table has no =0.0.0.0/0 -> igw-*= route is reported as
+   internet-exposed. It is not reachable.
+2. *False negatives* — a NACL denying the port, or reachability arriving via
+   transit gateway / VPC peering from a less-trusted VPC, is not reflected.
+
+The =aws_lb_nacl_direct= job draws a =PROTECTS= edge from NACL to load
+balancer but never evaluates the rules on it. Closing this gap is pure
+derivation work over data already in the graph — the highest value-per-effort
+item in this document.
+
+IPv6 is a related blind spot: the exposure jobs match the literal string
+=0.0.0.0/0= and never =::/0=.
+
+** C. Detective and preventive control state is partially blind
+
+The maintainers' own =# TODO= markers document most of this. Verified status:
+
+| Control                                  | State                                                    |
+|------------------------------------------+----------------------------------------------------------|
+| IAM account password policy              | *Not modeled* — blocks CIS AWS 2.7, 2.8                   |
+| IAM credential report                    | *Not modeled* — blocks CIS AWS 2.9 (console user w/o MFA) |
+| KMS key rotation status                  | *Not modeled* — blocks CIS AWS 4.6                        |
+| VPC Flow Logs                            | *Not modeled* — blocks CIS AWS 4.7                        |
+| CloudTrail data-event selectors          | *Not modeled* — blocks CIS AWS 4.8, 4.9                   |
+| IAM Access Analyzer                      | *Not modeled* — blocks CIS AWS 2.19                       |
+| AWS Config recorder + delivery channel   | *Modeled* — the TODO at =cis_aws_logging.py:361= is stale |
+| Security Hub subscription                | *Modeled* — the TODO at =cis_aws_logging.py:386= is stale |
+| KMS =customer_master_key_spec=           | *Modeled* — half of the 4.6 TODO is already satisfiable   |
+
+Note on KMS: the TODO claims both the key-spec discriminator and rotation
+state are missing. Only rotation state actually is —
+=cartography/models/aws/kms/keys.py= already carries
+=customer_master_key_spec=. Two of the logging TODOs are similarly stale. The
+repo ships an =audit-frameworks= skill for exactly this reconciliation; it
+appears not to have been run recently.
+
+IAM Access Analyzer deserves separate emphasis. It is AWS's own authoritative
+answer to "which resources are reachable from outside the trust zone",
+computed with full policy semantics including conditions and SCPs. Ingesting
+its findings would sidestep much of gap A at a fraction of the implementation
+cost — not as a replacement for graph-native evaluation, but as ground truth
+to validate it against.
+
+** D. Credential and secret material is not surfaced
+
+Secrets Manager secrets and SSM parameters are modeled as *nodes*, but the
+places where secrets actually leak are not ingested:
+
+- *EC2 user data* — =grep -rn "UserData"= over =models/aws/= returns nothing.
+  Plaintext credentials in user data remain a routine finding in real
+  engagements.
+- *Launch template user data* — same.
+- *Lambda environment variables* — the model carries =Runtime=, =Role= and the
+  KMS key ARN, but not the variables themselves.
+- *ECS container definition environment variables* — =container_definitions.py=
+  carries only =name=.
+- CodeBuild is the exception and shows the right pattern: it ingests
+  =environmentVariables= with non-plaintext types redacted to =<REDACTED>=.
+
+That CodeBuild redaction convention is the template to generalise. It gives
+the assessor the *shape* of the secret exposure (a plaintext variable named
+=DB_PASSWORD= exists on this function) without Cartography itself becoming a
+secret store.
+
+Also absent: IAM Roles Anywhere trust anchors and profiles, which are an
+increasingly common ingress path for on-prem workloads into an AWS account.
+
+** E. Unmodeled AWS services with real attack-path relevance
+
+Ranked by how often they appear in an actual account compromise:
+
+| Service                    | Why it matters                                                          |
+|----------------------------+-------------------------------------------------------------------------|
+| *RAM (Resource Access Mgr)* | Cross-account resource shares — an entire invisible trust channel       |
+| *Step Functions*            | State machines assume roles and orchestrate privileged actions          |
+| *AppSync*                   | Public GraphQL endpoints with API-key auth, frequently over-permissioned |
+| *Network Firewall / WAF*    | Compensating controls; without them exposure findings overstate risk     |
+| *Route 53 Resolver*         | Resolver rules and DNS Firewall — exfiltration channel                  |
+| *Transfer Family*           | Internet-facing SFTP/FTPS fronting S3                                   |
+| *MSK / Kinesis / Firehose*  | Data-in-motion, commonly with open SGs                                  |
+| *Neptune / DocumentDB / MemoryDB* | Databases entirely outside the =Database= ontology label          |
+| *AWS Backup*                | Vault access policies and cross-account copy = data egress path         |
+| *App Runner / Amplify / Lightsail* | Public by default, outside the VPC exposure model                |
+| *ECR Public*                | Public registries under the account                                     |
+| *Athena / Glue catalog*     | Query surface over S3 that bypasses bucket-level reasoning              |
+| *CodePipeline / CodeDeploy* | CI/CD into the account; CodeBuild alone is half the picture             |
+| *ACM PCA*                   | Private CA — issuing power is a trust-anchor compromise                 |
+| *Security Lake / Detective* | Existing security telemetry that could be correlated rather than duplicated |
+
+** F. No temporal dimension
+
+The graph is a *current-state snapshot*. Nodes carry =lastupdated=; the only
+first-seen semantics anywhere are
+=first_seen_in_time_window= on the CloudTrail management-event MatchLinks.
+
+There is no notion of:
+
+- when a resource first appeared or was deleted
+- configuration drift between syncs
+- a diff view ("what changed since last week")
+
+For assessment this matters in three ways: you cannot distinguish a
+long-standing accepted risk from something introduced yesterday; you cannot
+evidence remediation; and you cannot detect the classic backdoor pattern of a
+privileged principal created and then quietly left in place.
+
+** G. CloudTrail is used for one narrow purpose
+
+=cloudtrail_management_events.py= is ~1000 lines that ingest exactly three
+event families: =AssumeRole=, =AssumeRoleWithSAML=, =AssumeRoleWithWebIdentity=.
+These become =ASSUMED_ROLE*= MatchLinks — genuinely valuable, because they show
+*actually exercised* trust rather than merely granted trust.
+
+The same machinery is not applied to the events that matter most for detecting
+an in-progress compromise: =CreateUser=, =CreateAccessKey=, =AttachUserPolicy=,
+=PutUserPolicy=, =CreateLoginProfile=, =UpdateAssumeRolePolicy=,
+=DeactivateMFADevice=, =StopLogging=, =DeleteTrail=, =PutBucketPolicy=,
+=ModifySnapshotAttribute=, =GetSecretValue=. Nor is the console-login event
+stream used to derive per-principal source-IP and geography.
+
+The cost here is low — the ingestion pattern already exists and is proven.
+
+** H. Blast radius has no data-sensitivity input
+
+The graph can tell you a bucket is public. It cannot tell you whether it holds
+customer PII or build artifacts, so every public bucket ranks identically.
+
+Missing inputs: Macie classification findings, S3 object-level metadata, and
+any notion of a data-classification tag convention. =aws_tagging.py= exists and
+tags are modeled as a =Tag= ontology label, so a tag-driven sensitivity
+heuristic (=Classification=, =DataClass=, =Confidentiality=) is achievable
+without any new API.
+
+Relatedly, there is no ownership dimension — no mapping from resource to
+responsible team — which is what turns a finding list into a remediation plan.
+
+* Prioritised recommendations
+
+Ordered by (security value) / (implementation cost). Entry points are given so
+each item can be picked up directly.
+
+** Tier 1 — high value, low cost, mostly derivation over existing data
+
+1. *Network reachability analysis job.* Extend
+   =cartography/analysis/aws/analysis.py= so =exposed_internet= is gated on an
+   actual =0.0.0.0/0 -> igw-*= route in the subnet's route table, and refuted
+   by a matching NACL deny. Add =::/0= alongside =0.0.0.0/0= throughout. All
+   required nodes already exist. Use the =analysis-jobs= skill.
+
+2. *Reconcile the rules TODO backlog.* Run the repo's own =audit-frameworks=
+   skill. At least three AWS TODOs (Config recorder, Security Hub, half of KMS
+   4.6) are satisfiable against today's schema. Cheapest possible coverage gain.
+
+3. *Privilege-escalation permission map.* Extend
+   =cartography/data/permission_relationships.yaml= with =iam:PassRole=,
+   =iam:CreatePolicyVersion=, =iam:AttachUserPolicy=,
+   =lambda:UpdateFunctionCode=, =ssm:SendCommand=, =cloudformation:CreateStack=
+   and friends, as =CAN_ESCALATE_TO= edges. Configuration-only change against
+   an engine that already supports it.
+
+4. *IAM account password policy + credential report.* Two API calls
+   (=get_account_password_policy=, =get_credential_report=), one node schema
+   each, and three CIS controls unblock immediately. Use the =add-node-type= skill.
+
+5. *KMS key rotation status.* =get_key_rotation_status= per key, one property
+   on the existing =AWSKMSKey= schema. Completes CIS AWS 4.6.
+
+** Tier 2 — high value, moderate cost
+
+6. *IAM Access Analyzer ingestion.* External-access and unused-access findings
+   as nodes linked to the resources they concern. Closes CIS AWS 2.19 and gives
+   an authoritative cross-check on the permission graph.
+
+7. *Service Control Policies and Resource Control Policies.* Model =SCP= /
+   =RCP= nodes attached to Org roots, OUs and accounts. Even without full
+   evaluation, exposing "which SCPs apply to this account" converts every
+   permission edge from an unqualified claim into a qualified one. Use
+   =add-node-type= plus =add-relationship=.
+
+8. *Permissions boundaries.* A property on =AWSRole= / =AWSUser= plus an edge
+   to the boundary =AWSPolicy=. Small change, materially better precision.
+
+9. *Resource-policy ingestion and evaluation.* Lambda, SQS, SNS, ECR, Secrets
+   Manager, EFS, OpenSearch. Then feed all resource policies — including the
+   S3 and KMS ones already ingested — into the permission engine so
+   cross-account grants become graph edges.
+
+10. *Secret-material surface.* EC2 and launch-template user data, Lambda and
+    ECS environment variables, following the CodeBuild redaction convention
+    (plaintext kept, references redacted). Expose as a =PLAINTEXT_SECRET_RISK=
+    style property or dedicated rule.
+
+** Tier 3 — high value, higher cost
+
+11. *Broaden CloudTrail to persistence and defence-evasion events.* Reuse the
+    existing =cloudtrail_management_events= machinery for IAM mutation, trail
+    tampering, secret retrieval and snapshot-sharing events.
+
+12. *Temporal layer.* Add =firstseen= at minimum, ideally an append-only change
+    log per node. Unlocks drift detection, remediation evidence, and
+    newly-introduced-risk alerting.
+
+13. *Data sensitivity.* Start with a tag-convention heuristic over the existing
+    =Tag= ontology label; optionally add Macie findings. Feeds blast-radius
+    scoring so public-storage findings can be ranked rather than listed.
+
+14. *Fill the service gaps in [[E. Unmodeled AWS services with real attack-path relevance]]*,
+    prioritising RAM, Step Functions, AppSync and Transfer Family. Use the
+    =create-module= skill.
+
+** Tier 4 — strategic
+
+15. *Cross-provider attack-path rules.* The ontology exists and is the
+    project's real differentiator, but the rules mostly ask per-provider
+    questions. The uniquely valuable queries are the ones no single-cloud CSPM
+    can express: "a GitHub Actions workflow assumes an AWS role that can read a
+    bucket holding production data", "an Okta user disabled in the IdP still
+    has live AWS access keys", "a CVE in a container image running on a pod
+    whose service account can read cluster secrets". Use the =create-rule= skill.
+
+16. *Compensating-control awareness.* Once WAF and Network Firewall are
+    modeled, downgrade exposure findings that sit behind them. Precision here
+    is what separates a report a customer acts on from one they dismiss.
+
+* Summary
+
+Cartography's *inventory breadth is not the problem* — 63 providers, 1054 node
+schemas and a working cross-provider ontology put it ahead of most commercial
+CSPM tooling on raw coverage.
+
+The gaps are concentrated in *derivation and semantics*:
+
+- permissions are evaluated without SCPs, boundaries, resource policies or
+  condition semantics, so every IAM finding is an unqualified upper bound
+- reachability is inferred from security groups alone, while the route table
+  and NACL data needed to compute it properly is already sitting in the graph
+- the graph has no memory, so nothing can be said about change
+- there is no sensitivity or ownership dimension, so findings cannot be ranked
+  or routed
+
+The encouraging conclusion is that the highest-value fixes (items 1–5) are
+mostly *derivation over data already ingested*, or one-API-call additions —
+not new integrations.
